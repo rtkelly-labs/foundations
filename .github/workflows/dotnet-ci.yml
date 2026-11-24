@@ -1,0 +1,281 @@
+name: dotnet-ci
+
+# Reusable C# CI: analyze, format, sharded tests with coverage, and the coverage ratchet.
+#
+# The caller keeps its own change detection and its aggregate required check, and calls this with the same SHA it pins
+# in paket.dependencies. The repo must import the foundations files through Paket's `Build` group (see README.md); the
+# coverage ratchet runs from paket-files.
+#
+#   dotnet:
+#     needs: changes
+#     if: needs.changes.outputs.code == 'true'
+#     permissions:
+#       contents: read
+#     uses: rtkelly-labs/foundations/.github/workflows/dotnet-ci.yml@<sha>
+#     with:
+#       solution: app.slnx
+#       shards: >-
+#         [{"shard": "core", "projects": "tests/App.Core.Tests/App.Core.Tests.csproj"},
+#          {"shard": "browser", "projects": "tests/App.BrowserTests/App.BrowserTests.csproj", "playwright": true}]
+#       test-args: --coverlet-include [App.*]*
+
+on:
+  workflow_call:
+    inputs:
+      solution:
+        description: The solution (.sln or .slnx) to restore, analyze and format.
+        type: string
+        required: true
+      shards:
+        description: >-
+          JSON array of test shards. Each has `shard` (a name), `projects` (space-separated test project paths) and an
+          optional `playwright: true`, which installs Playwright's Chromium after the build.
+        type: string
+        required: true
+      test-args:
+        description: >-
+          Extra arguments for every `dotnet test`, such as coverlet include and exclude filters. Split on whitespace and
+          never globbed, so quote nothing.
+        type: string
+        default: ""
+      analyze-args:
+        description: Extra arguments for the analyzer build of the whole solution.
+        type: string
+        default: ""
+      timeout-minutes:
+        description: Timeout for each job.
+        type: number
+        default: 10
+      foundations-path:
+        description: Where Paket restores the foundations files.
+        type: string
+        default: paket-files/build/rtkelly-labs/foundations
+
+permissions: {}
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  # Warnings are errors with every analyzer on. One build of the whole solution enforces them for every project, so
+  # the test shards compile without them.
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      SOLUTION: ${{ inputs.solution }}
+      ANALYZE_ARGS: ${{ inputs.analyze-args }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('paket.lock', '**/*.csproj', 'global.json') }}
+      # Directory.Build.props imports files Paket restores, so Paket runs before MSBuild evaluates any project.
+      - name: Restore
+        run: |
+          set -euo pipefail
+          dotnet tool restore
+          dotnet paket restore
+          dotnet restore "${SOLUTION}"
+      - name: Build with analyzers
+        run: |
+          set -euo pipefail
+          read -ra extra <<< "${ANALYZE_ARGS}"
+          dotnet build "${SOLUTION}" --no-restore -c Release "${extra[@]}"
+
+  # Formatting is off the build and test critical path. Pull requests check only the changed C# files; a change to the
+  # formatting or build configuration, or any other event, checks the whole solution.
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      SOLUTION: ${{ inputs.solution }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('paket.lock', '**/*.csproj', 'global.json') }}
+      - name: Restore
+        run: |
+          set -euo pipefail
+          dotnet tool restore
+          dotnet paket restore
+          dotnet restore "${SOLUTION}"
+      - name: Format changed files
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          full() { dotnet format "${SOLUTION}" --no-restore --verify-no-changes; }
+          if [ "${EVENT}" != "pull_request" ]; then
+            full
+            exit 0
+          fi
+          base="${PR_BASE}"
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            full
+            exit 0
+          fi
+          range="${base}...HEAD"
+          if git diff --name-only --no-renames "${range}" | grep -Eq '(^|/)(\.editorconfig|\.globalconfig|Directory\.Build\.props|Directory\.Build\.targets|paket\.dependencies|paket\.lock)$'; then
+            full
+            exit 0
+          fi
+          mapfile -d '' -t files < <(git diff --name-only -z --no-renames --diff-filter=ACMRT "${range}" -- '*.cs')
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No C# files changed"
+            exit 0
+          fi
+          dotnet format "${SOLUTION}" --no-restore --verify-no-changes --include "${files[@]}"
+
+  # Tests, sharded so each runner builds only the projects it tests. The coverage job unions the shards' coverlet
+  # reports, which keep each line and branch identity, so the floor still measures the whole codebase.
+  dotnet:
+    name: dotnet (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      PROJECTS: ${{ matrix.projects }}
+      TEST_ARGS: ${{ inputs.test-args }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('paket.lock', '**/*.csproj', 'global.json') }}
+      - name: Restore
+        env:
+          SOLUTION: ${{ inputs.solution }}
+        run: |
+          set -euo pipefail
+          dotnet tool restore
+          dotnet paket restore
+          dotnet restore "${SOLUTION}"
+      # Analyzers run once in `analyze`; the shards skip them.
+      - name: Build
+        run: |
+          set -euo pipefail
+          read -ra projects <<< "${PROJECTS}"
+          for project in "${projects[@]}"; do
+            dotnet build "$project" --no-restore -c Release -p:RunAnalyzers=false
+          done
+      # Playwright's browsers are cached on paket.lock, which pins the Playwright version.
+      - name: Cache Playwright Chromium
+        if: matrix.playwright == true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-dotnet-linux-${{ hashFiles('paket.lock') }}
+      - name: Install Playwright Chromium
+        if: matrix.playwright == true && steps.playwright-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          script="$(find . -path '*/bin/Release/*/playwright.ps1' -print -quit)"
+          if [ -z "${script}" ]; then
+            echo "::error::No playwright.ps1 under a built project's bin/Release."
+            exit 1
+          fi
+          pwsh "${script}" install --with-deps chromium
+      - name: Test with coverage
+        run: |
+          set -euo pipefail
+          read -ra projects <<< "${PROJECTS}"
+          read -ra extra <<< "${TEST_ARGS}"
+          for project in "${projects[@]}"; do
+            dotnet test --project "$project" --no-build -c Release --report-trx --coverlet --coverlet-output-format json \
+              "${extra[@]}"
+          done
+      - name: Upload coverage report
+        if: always() && hashFiles('TestResults/coverage.*.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dotnet-coverage-${{ matrix.shard }}
+          path: TestResults/coverage.*.json
+          retention-days: 1
+      # One TRX per test project: per-test durations, so a slow run names its slow tests.
+      - name: Upload test results
+        if: always() && hashFiles('TestResults/*.trx') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dotnet-trx-${{ matrix.shard }}
+          path: TestResults/*.trx
+          retention-days: 14
+
+  # A ratchet over every shard's report: the floor never falls, and must follow coverage up to the target.
+  dotnet-coverage:
+    name: dotnet-coverage
+    needs: dotnet
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    env:
+      FOUNDATIONS: ${{ inputs.foundations-path }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+      - name: Restore the foundations files
+        run: |
+          set -euo pipefail
+          dotnet tool restore
+          dotnet paket restore --group Build
+      - name: Download coverage reports
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dotnet-coverage-*
+          path: TestResults
+          merge-multiple: true
+      - name: Fetch the base branch's coverage floor
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/contents/Directory.Build.props?ref=${BASE_SHA}" \
+            -H "Accept: application/vnd.github.raw" > base-Directory.Build.props || rm -f base-Directory.Build.props
+      - name: Coverage floor ratchet
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(TestResults/coverage.*.json)
+          dotnet run "${FOUNDATIONS}/dotnet/scripts/coverage-floor.cs" -- "${reports[@]}" --base-props base-Directory.Build.props

@@ -1,0 +1,22 @@
+<Project>
+  <!-- Import it from the repo's Directory.Build.targets:
+
+         <Import Project="$(MSBuildThisFileDirectory)paket-files/build/rtkelly-labs/foundations/dotnet/Common.targets" />
+
+       Paket's paket.references has no PrivateAssets flag, and PaketRestore adds the PackageReference items while restore
+       runs, so an item set at evaluation time cannot reach them. This sets the flag right after it runs.
+       Private: the banned-API analyzer, plus every package named in PaketPrivatePackages (semicolon separated, set in the
+       repo's Directory.Build.props or .targets), such as build-time source generators.
+       Everything else flows to consumers, as it would under Central Package Management. Paket would otherwise make every
+       package of a PackAsTool project private, and test projects that reference that tool need its packages. -->
+  <Target Name="CommonPaketPrivateAssets" AfterTargets="PaketRestore">
+    <!-- Read when the target runs, so PaketPrivatePackages may be set anywhere, before or after this import. -->
+    <PropertyGroup>
+      <_CommonPrivatePackages>;Microsoft.CodeAnalysis.BannedApiAnalyzers;$(PaketPrivatePackages);</_CommonPrivatePackages>
+    </PropertyGroup>
+    <ItemGroup>
+      <PackageReference Condition="$(_CommonPrivatePackages.Contains(';%(Identity);'))" PrivateAssets="all" />
+      <PackageReference Condition="!$(_CommonPrivatePackages.Contains(';%(Identity);'))" PrivateAssets="" />
+    </ItemGroup>
+  </Target>
+</Project>

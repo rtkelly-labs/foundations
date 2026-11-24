@@ -1,0 +1,9 @@
+<Project>
+  <!-- A consumer as Paket lays it out would import paket-files/build/rtkelly-labs/foundations/dotnet/Common.props. -->
+  <Import Project="$(MSBuildThisFileDirectory)../../dotnet/Common.props" />
+  <PropertyGroup>
+    <CoverageFloor>82</CoverageFloor>
+    <CoverageTarget>95</CoverageTarget>
+    <CoverageSlack>2</CoverageSlack>
+  </PropertyGroup>
+</Project>

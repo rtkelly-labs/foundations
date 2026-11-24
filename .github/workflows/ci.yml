@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  # A consumer laid out as Paket restores one: the shared props and targets build a project with every analyzer on,
+  # and the shared scripts run against synthetic reports.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+    defaults:
+      run:
+        working-directory: tests/consumer
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: tests/consumer/global.json
+      - name: Build with the shared settings
+        run: dotnet build src/Smoke -c Release
+      - name: The coverage ratchet holds a floor coverage supports
+        run: dotnet run ../../dotnet/scripts/coverage-floor.cs -- coverage/coverage.a.json coverage/coverage.b.json
+      - name: The coverage ratchet rejects a floor above coverage
+        run: |
+          set -euo pipefail
+          sed 's/<CoverageFloor>82</<CoverageFloor>90</' Directory.Build.props > high.props
+          if dotnet run ../../dotnet/scripts/coverage-floor.cs -- coverage/coverage.a.json coverage/coverage.b.json --props high.props; then
+            echo "::error::A floor above measured coverage passed."
+            exit 1
+          fi
+      - name: The job gate passes success and skipped, and fails anything else
+        run: |
+          set -euo pipefail
+          NEEDS_JSON='{"a":{"result":"success"},"b":{"result":"skipped"}}' dotnet run ../../dotnet/scripts/require-jobs-succeeded.cs
+          if NEEDS_JSON='{"a":{"result":"failure"}}' dotnet run ../../dotnet/scripts/require-jobs-succeeded.cs; then
+            echo "::error::A failed job passed the gate."
+            exit 1
+          fi
+
+  # Squash merges take the pull request title as the commit subject, so it follows Conventional Commits.
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Conventional Commits title
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: .+'
+          if [[ ! "${TITLE}" =~ ${pattern} ]]; then
+            echo "::error::Title '${TITLE}' is not a Conventional Commits subject, such as 'feat(dotnet): add a shared target'."
+            exit 1
+          fi

@@ -1,0 +1,1 @@
+{"Smoke.dll":{"src/Smoke/Greeting.cs":{"Smoke.Greeting":{"System.String Smoke.Greeting::For(System.String)":{"Lines":{"9":0,"11":1},"Branches":[{"Line":9,"Offset":1,"EndOffset":3,"Path":1,"Ordinal":1,"Hits":1},{"Line":11,"Offset":4,"EndOffset":5,"Path":0,"Ordinal":2,"Hits":0}]}}}}}

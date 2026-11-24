@@ -1,0 +1,59 @@
+<Project>
+  <!-- Shared build settings for C# repos. Import it first from the repo's Directory.Build.props; anything set after the
+       import overrides it:
+
+         <Import Project="$(MSBuildThisFileDirectory)paket-files/build/rtkelly-labs/foundations/dotnet/Common.props" />
+
+       The bar: nullable on, warnings are errors, every analyzer on, deterministic builds. -->
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-all</AnalysisLevel>
+    <AnalysisModePerformance>AllEnabled</AnalysisModePerformance>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- ICU, not invariant mode: string.Normalize and culture-aware text need it. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <IsPackable>false</IsPackable>
+    <DebugType>embedded</DebugType>
+    <RepositoryType>git</RepositoryType>
+    <!-- Paket lists every package in paket.lock as a direct PackageReference, including ones the shared framework
+         already provides. NuGet's package pruning then warns (NU1510) that it will not prune them; the warning is noise. -->
+    <NoWarn>$(NoWarn);NU1510</NoWarn>
+  </PropertyGroup>
+
+  <!-- The repo root is the nearest folder above the project with a global.json. Set RepoRoot before the import to
+       override it. -->
+  <PropertyGroup>
+    <RepoRoot Condition="'$(RepoRoot)' == ''">$([MSBuild]::GetDirectoryNameOfFileAbove('$(MSBuildProjectDirectory)', 'global.json'))</RepoRoot>
+    <RepoRoot Condition="'$(RepoRoot)' != ''">$([MSBuild]::EnsureTrailingSlash('$(RepoRoot)'))</RepoRoot>
+  </PropertyGroup>
+
+  <!-- Nothing from a checkout above this one. A worktree can live inside another checkout, and the SDK looks upward
+       for both files: a second .globalconfig makes Roslyn unset the keys they share (so the banned-API analyzer flags
+       generated code), and an outer Directory.Packages.props duplicates the versions Paket already pins (NU1506).
+       Only the repo's own .globalconfig is read, and Paket owns package versions. -->
+  <PropertyGroup>
+    <DiscoverGlobalAnalyzerConfigFiles>false</DiscoverGlobalAnalyzerConfigFiles>
+    <ImportDirectoryPackagesProps>false</ImportDirectoryPackagesProps>
+  </PropertyGroup>
+  <ItemGroup>
+    <EditorConfigFiles Include="$(RepoRoot).globalconfig" Condition="'$(RepoRoot)' != '' and Exists('$(RepoRoot).globalconfig')" />
+  </ItemGroup>
+
+  <!-- Banned APIs: this folder's list for every repo, plus the repo's own root BannedSymbols.txt when it has one. The
+       analyzer reads every additional file named BannedSymbols.txt. -->
+  <ItemGroup>
+    <AdditionalFiles Include="$(MSBuildThisFileDirectory)BannedSymbols.txt" />
+    <AdditionalFiles Include="$(RepoRoot)BannedSymbols.txt" Link="BannedSymbols.txt" Condition="'$(RepoRoot)' != '' and Exists('$(RepoRoot)BannedSymbols.txt')" />
+  </ItemGroup>
+
+  <!-- The coverage ratchet (scripts/coverage-floor.cs) reads CoverageFloor, CoverageTarget and CoverageSlack as literal
+       elements of the repo's Directory.Build.props, so a pull request can be compared with its base branch's file. Set
+       them there; the script defaults the target to 95 and the slack to 2. -->
+</Project>
